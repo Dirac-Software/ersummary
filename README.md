@@ -1,6 +1,8 @@
 # ersummary
 A tool to generate summary ERD from a subset of tables in a PostgreSQL database
 
+# Description
+
 When first approaching a complex data model, it helps to focus on a subset of
 key tables. This tool generates an Entity-Relation Diagram (ERD) in
 [MermaidJs][1] format, much as [Mermerd][2] does, with the following
@@ -10,6 +12,9 @@ differences:
   consideration
 * it is much faster, because it queries the data dictionary in a single pass
 
+# Installation
+
+To build, you need Go installed, then simply run `go build` in this directory.
 
 1: https://mermaid.js.org/syntax/entityRelationshipDiagram.html
 2: https://github.com/KarnerTh/mermerd
