@@ -5,7 +5,7 @@ A tool to generate summary ERD from a subset of tables in a PostgreSQL database
 
 When first approaching a complex data model, it helps to focus on a subset of
 key tables. This tool generates an Entity-Relation Diagram (ERD) in
-[MermaidJs][1] format, much as [Mermerd][2] does, with the following
+[MermaidJs](1) format, much as [Mermerd](2) does, with the following
 differences:
 * it accurately describes the relationship between tables even when they are
   mediated by junction tables that are not in the set of tables under
