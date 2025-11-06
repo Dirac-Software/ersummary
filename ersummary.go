@@ -29,8 +29,10 @@ type Column struct {
 }
 
 type ForeignKey struct {
+	FromSchema     string
 	FromTable      string
 	FromColumn     string
+	ToSchema       string
 	ToTable        string
 	ToColumn       string
 	ConstraintName string
@@ -56,23 +58,37 @@ type ColumnInfo struct {
 
 func main() {
 	var connStr string
-	var schema string
+	var schemasStr string
 	var tablesStr string
+	var tableRegex string
 	var showColumns bool
 
 	flag.StringVar(&connStr, "conn", "", "PostgreSQL connection string")
-	flag.StringVar(&schema, "schema", "public", "Database schema")
-	flag.StringVar(&tablesStr, "tables", "", "Comma-separated list of tables")
+	flag.StringVar(&schemasStr, "schema", "public", "Comma-separated list of database schemas")
+	flag.StringVar(&tablesStr, "tables", "", "Comma-separated list of table names (optionally schema-qualified: schema.table)")
+	flag.StringVar(&tableRegex, "table-regex", "", "Regular expression (ERE) to match table names")
 	flag.BoolVar(&showColumns, "show-columns", false, "Show table columns in the diagram")
 	flag.Parse()
 
-	if connStr == "" || tablesStr == "" {
-		log.Fatal("Connection string and tables list are required")
+	if connStr == "" {
+		log.Fatal("Connection string is required")
 	}
 
-	tables := strings.Split(tablesStr, ",")
-	for i := range tables {
-		tables[i] = strings.TrimSpace(tables[i])
+	if tablesStr == "" && tableRegex == "" {
+		log.Fatal("Either -tables or -table-regex must be specified")
+	}
+
+	schemas := strings.Split(schemasStr, ",")
+	for i := range schemas {
+		schemas[i] = strings.TrimSpace(schemas[i])
+	}
+
+	var tableNames []string
+	if tablesStr != "" {
+		tableNames = strings.Split(tablesStr, ",")
+		for i := range tableNames {
+			tableNames[i] = strings.TrimSpace(tableNames[i])
+		}
 	}
 
 	db, err := sql.Open("postgres", connStr)
@@ -86,59 +102,189 @@ func main() {
 		log.Fatal("Error pinging database:", err)
 	}
 
-	// Get ALL foreign keys in the schema to build complete graph
-	allForeignKeys, err := getAllForeignKeys(db, schema)
+	// Get ALL foreign keys in the database to build complete graph
+	// (relationships may go through tables in other schemas)
+	allForeignKeys, err := getAllForeignKeys(db)
 	if err != nil {
 		log.Fatal("Error fetching all foreign keys:", err)
 	}
 
-	// Filter foreign keys for selected tables (for column display)
-	selectedForeignKeys := filterForeignKeys(allForeignKeys, tables)
+	// Get list of tables matching the criteria
+	tables, err := getMatchingTables(db, schemas, tableNames, tableRegex)
+	if err != nil {
+		log.Fatal("Error fetching matching tables:", err)
+	}
 
-	relationships := calculateCardinalities(db, schema, tables, allForeignKeys)
+	if len(tables) == 0 {
+		log.Fatal("No tables matched the provided criteria")
+	}
+
+	// Extract qualified table names for filtering
+	qualifiedTableNames := make([]string, len(tables))
+	for i, t := range tables {
+		qualifiedTableNames[i] = getQualifiedName(t.Schema, t.Name)
+	}
+
+	// Filter foreign keys for selected tables (for column display)
+	selectedForeignKeys := filterForeignKeys(allForeignKeys, qualifiedTableNames)
+
+	relationships := calculateCardinalities(db, schemas, qualifiedTableNames, allForeignKeys)
 
 	var tableDetails []Table
 	if showColumns {
-		tableDetails, err = getTableColumns(db, schema, tables, selectedForeignKeys)
+		tableDetails, err = getTableColumns(db, tables, selectedForeignKeys)
 		if err != nil {
 			log.Fatal("Error fetching table columns:", err)
 		}
 	} else {
-		for _, tableName := range tables {
-			tableDetails = append(tableDetails, Table{Name: tableName, Schema: schema})
-		}
+		tableDetails = tables
 	}
 
 	// Build command line for comment
 	cmdLine := append([]string{os.Args[0]}, os.Args[1:]...)
-	mermaidDiagram := generateMermaidDiagram(tableDetails, relationships, schema, strings.Join(cmdLine, " "))
+	mermaidDiagram := generateMermaidDiagram(tableDetails, relationships, schemas[0], strings.Join(cmdLine, " "))
 	fmt.Println(mermaidDiagram)
 }
 
-func getAllForeignKeys(db *sql.DB, schema string) ([]ForeignKey, error) {
+func getMatchingTables(db *sql.DB, schemas []string, tableNames []string, tableRegex string) ([]Table, error) {
+	start := time.Now()
+	tableMap := make(map[string]Table) // Use map to deduplicate
+
+	// Handle exact table names from -tables option
+	if len(tableNames) > 0 {
+		for _, tableName := range tableNames {
+			// Check if table name is schema-qualified
+			if strings.Contains(tableName, ".") {
+				parts := strings.SplitN(tableName, ".", 2)
+				schema := parts[0]
+				table := parts[1]
+
+				// Query for this specific schema.table
+				query := `
+					SELECT table_schema, table_name
+					FROM information_schema.tables
+					WHERE table_schema = $1
+					AND table_name = $2
+					AND table_type = 'BASE TABLE'
+				`
+				rows, err := db.Query(query, schema, table)
+				if err != nil {
+					return nil, err
+				}
+				for rows.Next() {
+					var t Table
+					if err := rows.Scan(&t.Schema, &t.Name); err != nil {
+						rows.Close()
+						return nil, err
+					}
+					key := t.Schema + "." + t.Name
+					tableMap[key] = t
+				}
+				rows.Close()
+			} else {
+				// Unqualified table name - search in all specified schemas
+				schemaPlaceholders := make([]string, len(schemas))
+				args := make([]interface{}, len(schemas)+1)
+				for i, schema := range schemas {
+					schemaPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+					args[i] = schema
+				}
+				args[len(schemas)] = tableName
+
+				query := fmt.Sprintf(`
+					SELECT table_schema, table_name
+					FROM information_schema.tables
+					WHERE table_schema IN (%s)
+					AND table_name = $%d
+					AND table_type = 'BASE TABLE'
+				`, strings.Join(schemaPlaceholders, ", "), len(schemas)+1)
+
+				rows, err := db.Query(query, args...)
+				if err != nil {
+					return nil, err
+				}
+				for rows.Next() {
+					var t Table
+					if err := rows.Scan(&t.Schema, &t.Name); err != nil {
+						rows.Close()
+						return nil, err
+					}
+					key := t.Schema + "." + t.Name
+					tableMap[key] = t
+				}
+				rows.Close()
+			}
+		}
+	}
+
+	// Handle regex pattern from -table-regex option
+	if tableRegex != "" {
+		schemaPlaceholders := make([]string, len(schemas))
+		args := make([]interface{}, len(schemas)+1)
+		for i, schema := range schemas {
+			schemaPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = schema
+		}
+		args[len(schemas)] = tableRegex
+
+		query := fmt.Sprintf(`
+			SELECT table_schema, table_name
+			FROM information_schema.tables
+			WHERE table_schema IN (%s)
+			AND table_name ~ $%d
+			AND table_type = 'BASE TABLE'
+		`, strings.Join(schemaPlaceholders, ", "), len(schemas)+1)
+
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var t Table
+			if err := rows.Scan(&t.Schema, &t.Name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			key := t.Schema + "." + t.Name
+			tableMap[key] = t
+		}
+		rows.Close()
+	}
+
+	// Convert map to slice
+	tables := make([]Table, 0, len(tableMap))
+	for _, t := range tableMap {
+		tables = append(tables, t)
+	}
+
+	log.Printf("Found %d tables matching criteria (took %v)", len(tables), time.Since(start))
+	return tables, nil
+}
+
+func getAllForeignKeys(db *sql.DB) ([]ForeignKey, error) {
 	query := `
-		SELECT 
+		SELECT
+			tc.table_schema AS from_schema,
 			tc.table_name AS from_table,
 			kcu.column_name AS from_column,
+			ccu.table_schema AS to_schema,
 			ccu.table_name AS to_table,
 			ccu.column_name AS to_column,
 			tc.constraint_name
-		FROM 
-			information_schema.table_constraints AS tc 
+		FROM
+			information_schema.table_constraints AS tc
 			JOIN information_schema.key_column_usage AS kcu
 				ON tc.constraint_name = kcu.constraint_name
 				AND tc.table_schema = kcu.table_schema
 			JOIN information_schema.constraint_column_usage AS ccu
 				ON ccu.constraint_name = tc.constraint_name
-				AND ccu.table_schema = tc.table_schema
-		WHERE 
-			tc.constraint_type = 'FOREIGN KEY' 
-			AND tc.table_schema = $1
+		WHERE
+			tc.constraint_type = 'FOREIGN KEY'
 	`
 
-	log.Printf("Fetching all foreign keys from schema '%s'...", schema)
+	log.Printf("Fetching all foreign keys from database...")
 	start := time.Now()
-	rows, err := db.Query(query, schema)
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -147,15 +293,23 @@ func getAllForeignKeys(db *sql.DB, schema string) ([]ForeignKey, error) {
 	var foreignKeys []ForeignKey
 	for rows.Next() {
 		var fk ForeignKey
-		err := rows.Scan(&fk.FromTable, &fk.FromColumn, &fk.ToTable, &fk.ToColumn, &fk.ConstraintName)
+		err := rows.Scan(&fk.FromSchema, &fk.FromTable, &fk.FromColumn, &fk.ToSchema, &fk.ToTable, &fk.ToColumn, &fk.ConstraintName)
 		if err != nil {
 			return nil, err
 		}
 		foreignKeys = append(foreignKeys, fk)
 	}
 
-	log.Printf("Found %d foreign keys in schema '%s' (took %v)", len(foreignKeys), schema, time.Since(start))
+	log.Printf("Found %d foreign keys in database (took %v)", len(foreignKeys), time.Since(start))
 	return foreignKeys, rows.Err()
+}
+
+func getQualifiedName(schema, table string) string {
+	if schema == "public" || schema == "" {
+		return table
+	}
+	// Use dot internally for unambiguous parsing
+	return schema + "." + table
 }
 
 func filterForeignKeys(allForeignKeys []ForeignKey, tables []string) []ForeignKey {
@@ -166,7 +320,9 @@ func filterForeignKeys(allForeignKeys []ForeignKey, tables []string) []ForeignKe
 
 	var filtered []ForeignKey
 	for _, fk := range allForeignKeys {
-		if tableSet[fk.FromTable] && tableSet[fk.ToTable] {
+		fromQualified := getQualifiedName(fk.FromSchema, fk.FromTable)
+		toQualified := getQualifiedName(fk.ToSchema, fk.ToTable)
+		if tableSet[fromQualified] && tableSet[toQualified] {
 			filtered = append(filtered, fk)
 		}
 	}
@@ -184,10 +340,13 @@ func (n TableNode) ID() int64 {
 	return n.id
 }
 
-func calculateCardinalities(db *sql.DB, schema string, selectedTables []string, allForeignKeys []ForeignKey) []Relationship {
+func calculateCardinalities(db *sql.DB, schemas []string, selectedTables []string, allForeignKeys []ForeignKey) []Relationship {
 	if len(allForeignKeys) == 0 {
 		return []Relationship{}
 	}
+
+	// Use first schema for backward compatibility in relationship generation
+	schema := schemas[0]
 
 	// Build directed graph using gonum
 	g := simple.NewDirectedGraph()
@@ -197,18 +356,21 @@ func calculateCardinalities(db *sql.DB, schema string, selectedTables []string, 
 
 	// Add all tables as nodes
 	for _, fk := range allForeignKeys {
-		if _, exists := tableToNode[fk.FromTable]; !exists {
-			node := TableNode{id: nodeID, name: fk.FromTable}
+		fromQualified := getQualifiedName(fk.FromSchema, fk.FromTable)
+		toQualified := getQualifiedName(fk.ToSchema, fk.ToTable)
+
+		if _, exists := tableToNode[fromQualified]; !exists {
+			node := TableNode{id: nodeID, name: fromQualified}
 			g.AddNode(node)
-			tableToNode[fk.FromTable] = node
-			nodeToTable[nodeID] = fk.FromTable
+			tableToNode[fromQualified] = node
+			nodeToTable[nodeID] = fromQualified
 			nodeID++
 		}
-		if _, exists := tableToNode[fk.ToTable]; !exists {
-			node := TableNode{id: nodeID, name: fk.ToTable}
+		if _, exists := tableToNode[toQualified]; !exists {
+			node := TableNode{id: nodeID, name: toQualified}
 			g.AddNode(node)
-			tableToNode[fk.ToTable] = node
-			nodeToTable[nodeID] = fk.ToTable
+			tableToNode[toQualified] = node
+			nodeToTable[nodeID] = toQualified
 			nodeID++
 		}
 	}
@@ -217,11 +379,13 @@ func calculateCardinalities(db *sql.DB, schema string, selectedTables []string, 
 	// FK goes from child to parent, but we want edges from parent to child
 	// to find common descendants
 	for _, fk := range allForeignKeys {
-		if fk.FromTable == fk.ToTable {
+		fromQualified := getQualifiedName(fk.FromSchema, fk.FromTable)
+		toQualified := getQualifiedName(fk.ToSchema, fk.ToTable)
+		if fromQualified == toQualified {
 			continue // Skip self-references
 		}
-		fromNode := tableToNode[fk.FromTable]
-		toNode := tableToNode[fk.ToTable]
+		fromNode := tableToNode[fromQualified]
+		toNode := tableToNode[toQualified]
 		// Invert the edge direction: parent -> child
 		g.SetEdge(g.NewEdge(toNode, fromNode))
 	}
@@ -234,16 +398,18 @@ func calculateCardinalities(db *sql.DB, schema string, selectedTables []string, 
 	}
 
 	// Get column info for all FK columns in one query
-	columnInfo, err := getColumnInfo(db, schema, allForeignKeys)
+	columnInfo, err := getColumnInfo(db, schemas, allForeignKeys)
 	if err != nil {
 		log.Printf("Error fetching column info: %v", err)
 		return []Relationship{}
 	}
 
-	// Create FK lookup map
+	// Create FK lookup map using qualified names
 	fkMap := make(map[string]ForeignKey)
 	for _, fk := range allForeignKeys {
-		fkMap[fk.FromTable+"->"+fk.ToTable] = fk
+		fromQualified := getQualifiedName(fk.FromSchema, fk.FromTable)
+		toQualified := getQualifiedName(fk.ToSchema, fk.ToTable)
+		fkMap[fromQualified+"->"+toQualified] = fk
 	}
 
 	// Create map of selected tables for quick lookup
@@ -446,46 +612,51 @@ func calculateLCACardinality(lca, tableA, tableB string, pathCtoA, pathCtoB []st
 		fullPath = append(fullPath, pathCtoB[1:]...)
 	}
 
+	// Parse schema from qualified table names
+	schemaA, nameA := parseQualifiedName(tableA)
+	schemaB, nameB := parseQualifiedName(tableB)
+
 	return &Relationship{
-		From:            Table{Name: tableA, Schema: schema},
-		To:              Table{Name: tableB, Schema: schema},
+		From:            Table{Name: nameA, Schema: schemaA},
+		To:              Table{Name: nameB, Schema: schemaB},
 		FromCardinality: Cardinality{Min: fromMin, Max: fromMax},
 		ToCardinality:   Cardinality{Min: toMin, Max: toMax},
 		Path:            fullPath,
 	}
 }
 
-func getColumnInfo(db *sql.DB, schema string, foreignKeys []ForeignKey) (map[string]ColumnInfo, error) {
+func getColumnInfo(db *sql.DB, schemas []string, foreignKeys []ForeignKey) (map[string]ColumnInfo, error) {
 	if len(foreignKeys) == 0 {
 		return make(map[string]ColumnInfo), nil
 	}
 
-	// Build column info query
+	// Build column info query with schema, table, and column
 	var columnSpecs []string
 	for _, fk := range foreignKeys {
-		columnSpecs = append(columnSpecs, fmt.Sprintf("('%s', '%s', '%s')", fk.FromTable, fk.FromColumn, fk.FromTable+"."+fk.FromColumn))
+		qualifiedName := getQualifiedName(fk.FromSchema, fk.FromTable)
+		columnSpecs = append(columnSpecs, fmt.Sprintf("('%s', '%s', '%s', '%s')", fk.FromSchema, fk.FromTable, fk.FromColumn, qualifiedName+"."+fk.FromColumn))
 	}
 
 	query := fmt.Sprintf(`
 		WITH fk_columns AS (
-			SELECT * FROM (VALUES %s) AS t(table_name, column_name, table_column)
+			SELECT * FROM (VALUES %s) AS t(table_schema, table_name, column_name, table_column)
 		),
 		column_info AS (
-			SELECT 
+			SELECT
 				fk.table_column,
 				c.is_nullable = 'YES' as is_nullable,
 				EXISTS (
 					SELECT 1
 					FROM information_schema.table_constraints tc
-					JOIN information_schema.key_column_usage kcu 
+					JOIN information_schema.key_column_usage kcu
 						ON tc.constraint_name = kcu.constraint_name
-					WHERE tc.table_schema = $1 
-						AND tc.table_name = fk.table_name 
+					WHERE tc.table_schema = fk.table_schema
+						AND tc.table_name = fk.table_name
 						AND kcu.column_name = fk.column_name
 						AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
 						-- Check that this is the only column in the constraint
 						AND NOT EXISTS (
-							SELECT 1 
+							SELECT 1
 							FROM information_schema.key_column_usage kcu2
 							WHERE kcu2.constraint_name = tc.constraint_name
 								AND kcu2.table_schema = tc.table_schema
@@ -494,7 +665,7 @@ func getColumnInfo(db *sql.DB, schema string, foreignKeys []ForeignKey) (map[str
 				) as has_unique_constraint
 			FROM fk_columns fk
 			JOIN information_schema.columns c
-				ON c.table_schema = $1
+				ON c.table_schema = fk.table_schema
 				AND c.table_name = fk.table_name
 				AND c.column_name = fk.column_name
 		)
@@ -504,7 +675,7 @@ func getColumnInfo(db *sql.DB, schema string, foreignKeys []ForeignKey) (map[str
 
 	log.Printf("Fetching column info for %d foreign key columns...", len(foreignKeys))
 	start := time.Now()
-	rows, err := db.Query(query, schema)
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -560,16 +731,21 @@ func calculatePathCardinality(pathTables []string, fkMap map[string]ForeignKey, 
 
 	// For multi-hop paths, aggregate cardinalities
 	// This is a simplified version - you might want to implement more sophisticated logic
+	fromSchema, fromName := parseQualifiedName(pathTables[0])
+	toSchema, toName := parseQualifiedName(pathTables[len(pathTables)-1])
+
 	return &Relationship{
-		From:            Table{Name: pathTables[0], Schema: schema},
-		To:              Table{Name: pathTables[len(pathTables)-1], Schema: schema},
+		From:            Table{Name: fromName, Schema: fromSchema},
+		To:              Table{Name: toName, Schema: toSchema},
 		FromCardinality: Cardinality{Min: "0", Max: "*"},
 		ToCardinality:   Cardinality{Min: "0", Max: "*"},
 	}
 }
 
 func calculateDirectCardinality(fromTable, toTable string, fk ForeignKey, columnInfo map[string]ColumnInfo, schema string) *Relationship {
-	tableColumn := fk.FromTable + "." + fk.FromColumn
+	// Build qualified column lookup key
+	fromQualified := getQualifiedName(fk.FromSchema, fk.FromTable)
+	tableColumn := fromQualified + "." + fk.FromColumn
 	info, found := columnInfo[tableColumn]
 
 	min := "0"
@@ -583,93 +759,127 @@ func calculateDirectCardinality(fromTable, toTable string, fk ForeignKey, column
 			max = "1"
 		}
 	}
+
+	// Parse schema from qualified table names
+	fromSchema, fromName := parseQualifiedName(fromTable)
+	toSchema, toName := parseQualifiedName(toTable)
+
 	return &Relationship{
-		From:            Table{Name: fromTable, Schema: schema},
-		To:              Table{Name: toTable, Schema: schema},
+		From:            Table{Name: fromName, Schema: fromSchema},
+		To:              Table{Name: toName, Schema: toSchema},
 		FromCardinality: Cardinality{Min: min, Max: max},
 		ToCardinality:   Cardinality{Min: "1", Max: "1"},
 	}
 }
 
-func getTableColumns(db *sql.DB, schema string, tables []string, foreignKeys []ForeignKey) ([]Table, error) {
-	tableList := "'" + strings.Join(tables, "','") + "'"
+func parseQualifiedName(qualifiedName string) (string, string) {
+	parts := strings.SplitN(qualifiedName, ".", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "public", parts[0]
+}
 
-	// Create FK lookup map
+func getTableColumns(db *sql.DB, tables []Table, foreignKeys []ForeignKey) ([]Table, error) {
+	if len(tables) == 0 {
+		return []Table{}, nil
+	}
+
+	// Create FK lookup map using qualified names
 	fkLookup := make(map[string]bool)
 	for _, fk := range foreignKeys {
-		fkLookup[fk.FromTable+"."+fk.FromColumn] = true
+		qualifiedName := getQualifiedName(fk.FromSchema, fk.FromTable)
+		fkLookup[qualifiedName+"."+fk.FromColumn] = true
+	}
+
+	// Build WHERE conditions for each table
+	var conditions []string
+	args := make([]interface{}, 0, len(tables)*2)
+	argIndex := 1
+	for _, table := range tables {
+		conditions = append(conditions, fmt.Sprintf("(c.table_schema = $%d AND c.table_name = $%d)", argIndex, argIndex+1))
+		args = append(args, table.Schema, table.Name)
+		argIndex += 2
 	}
 
 	query := fmt.Sprintf(`
-		SELECT 
+		SELECT
+			c.table_schema,
 			c.table_name,
 			c.column_name,
 			c.data_type,
 			COALESCE(tc.constraint_type = 'PRIMARY KEY', false) as is_pk
-		FROM 
+		FROM
 			information_schema.columns c
-		LEFT JOIN information_schema.key_column_usage kcu 
-			ON c.table_schema = kcu.table_schema 
-			AND c.table_name = kcu.table_name 
+		LEFT JOIN information_schema.key_column_usage kcu
+			ON c.table_schema = kcu.table_schema
+			AND c.table_name = kcu.table_name
 			AND c.column_name = kcu.column_name
-		LEFT JOIN information_schema.table_constraints tc 
-			ON kcu.constraint_name = tc.constraint_name 
+		LEFT JOIN information_schema.table_constraints tc
+			ON kcu.constraint_name = tc.constraint_name
 			AND kcu.table_schema = tc.table_schema
 			AND tc.constraint_type = 'PRIMARY KEY'
-		WHERE 
-			c.table_schema = $1
-			AND c.table_name IN (%s)
-		ORDER BY 
-			c.table_name, 
+		WHERE
+			(%s)
+		ORDER BY
+			c.table_schema,
+			c.table_name,
 			c.ordinal_position
-	`, tableList)
+	`, strings.Join(conditions, " OR "))
 
-	log.Printf("Fetching table columns for: %s", strings.Join(tables, ", "))
+	log.Printf("Fetching table columns for %d tables", len(tables))
 	start := time.Now()
-	rows, err := db.Query(query, schema)
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	tableMap := make(map[string]*Table)
-	for _, tableName := range tables {
-		tableMap[tableName] = &Table{Name: tableName, Schema: schema, Columns: []Column{}}
-	}
 
 	for rows.Next() {
-		var tableName, columnName, dataType string
+		var schemaName, tableName, columnName, dataType string
 		var isPK bool
-		err := rows.Scan(&tableName, &columnName, &dataType, &isPK)
+		err := rows.Scan(&schemaName, &tableName, &columnName, &dataType, &isPK)
 		if err != nil {
 			return nil, err
 		}
 
-		if table, ok := tableMap[tableName]; ok {
-			isFK := fkLookup[tableName+"."+columnName]
-			table.Columns = append(table.Columns, Column{
-				Name:     columnName,
-				DataType: dataType,
-				IsPK:     isPK,
-				IsFK:     isFK,
-			})
+		tableKey := schemaName + "." + tableName
+		if _, ok := tableMap[tableKey]; !ok {
+			tableMap[tableKey] = &Table{Name: tableName, Schema: schemaName, Columns: []Column{}}
 		}
+
+		// Use qualified name for FK lookup
+		qualifiedTableName := getQualifiedName(schemaName, tableName)
+		isFK := fkLookup[qualifiedTableName+"."+columnName]
+		tableMap[tableKey].Columns = append(tableMap[tableKey].Columns, Column{
+			Name:     columnName,
+			DataType: dataType,
+			IsPK:     isPK,
+			IsFK:     isFK,
+		})
 	}
 
 	var result []Table
-	for _, tableName := range tables {
-		if table, ok := tableMap[tableName]; ok {
-			result = append(result, *table)
-		}
+	for _, table := range tableMap {
+		result = append(result, *table)
 	}
 
 	log.Printf("Retrieved column details for %d tables (took %v)", len(result), time.Since(start))
 	return result, rows.Err()
 }
 
+func getQualifiedTableName(table Table) string {
+	// Get qualified name with dots, then convert to underscores for Mermaid
+	// Mermaid only allows alphanumeric and underscore in entity names
+	qualifiedName := getQualifiedName(table.Schema, table.Name)
+	return strings.ReplaceAll(qualifiedName, ".", "_")
+}
+
 func generateMermaidDiagram(tables []Table, relationships []Relationship, schema string, commandLine string) string {
 	var sb strings.Builder
-	
+
 	// Add comments at the top
 	sb.WriteString("%%{init: {'theme':'neutral'}}%%\n")
 	sb.WriteString("%% Generated by https://github.com/Dirac-Software/ersummary\n")
@@ -677,7 +887,8 @@ func generateMermaidDiagram(tables []Table, relationships []Relationship, schema
 	sb.WriteString("\nerDiagram\n")
 
 	for _, table := range tables {
-		sb.WriteString(fmt.Sprintf("    %s {\n", table.Name))
+		qualifiedName := getQualifiedTableName(table)
+		sb.WriteString(fmt.Sprintf("    %s {\n", qualifiedName))
 		if len(table.Columns) > 0 {
 			for _, col := range table.Columns {
 				keyIndicator := ""
@@ -700,10 +911,12 @@ func generateMermaidDiagram(tables []Table, relationships []Relationship, schema
 		if len(rel.Path) > 2 {
 			label = fmt.Sprintf("via %s", strings.Join(rel.Path[1:len(rel.Path)-1], ", "))
 		}
+		fromName := getQualifiedTableName(rel.From)
+		toName := getQualifiedTableName(rel.To)
 		sb.WriteString(fmt.Sprintf("    %s %s %s : \"%s\"\n",
-			rel.From.Name,
+			fromName,
 			relType,
-			rel.To.Name,
+			toName,
 			label))
 	}
 
