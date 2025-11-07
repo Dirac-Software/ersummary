@@ -1,4 +1,4 @@
-module ersummary
+module github.com/Dirac-Software/ersummary
 
 go 1.21
 
